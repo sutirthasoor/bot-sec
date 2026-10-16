@@ -1,25 +1,22 @@
 # auth_service.py
-# Standalone Firebase token verification service for Render.
+# Firebase auth proxy for Render.
+# The browser talks to this service — no Firebase SDK, no firebaseConfig in the frontend.
 #
 # Endpoints:
-#   POST /verify
-#     Header: Authorization: Bearer <firebase_id_token>
-#     Returns 200 {ok: true, user: {...}}  if token valid AND active claim true
-#     Returns 401 {ok: false, error: "..."} if token missing/invalid/expired
-#     Returns 403 {ok: false, error: "..."} if token valid but active claim false
-#
-#   GET /health
-#     Returns 200 {ok: true} — for Render's health check
+#   GET  /health    → {ok, service, version}
+#   POST /login     {email, password} → {ok, idToken, refreshToken, expiresIn, user}
+#   POST /refresh   {refresh_token}   → {ok, idToken, refreshToken, expiresIn}
+#   POST /verify    Header: Bearer <idToken> → {ok, user} | 401/403
 
 import os
+import httpx
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import firebase_admin
 from firebase_admin import credentials, auth
 
 # ============================================================
-# Firebase service account — hardcoded.
-# Only keep this in a PRIVATE repository.
+# Firebase service account — hardcoded
 # ============================================================
 SERVICE_ACCOUNT = {
     "type": "service_account",
@@ -36,9 +33,17 @@ SERVICE_ACCOUNT = {
 }
 
 # ============================================================
-# App setup
+# Firebase Web API Key — from your firebaseConfig
 # ============================================================
-app = FastAPI(title="AMT Auth Service", version="1.0.0")
+FIREBASE_WEB_API_KEY = "AIzaSyC4MJwGGoKGUUI7dlgC0IDn9dSQt95kUdo"
+
+IDENTITY_BASE    = "https://identitytoolkit.googleapis.com/v1"
+SECURETOKEN_BASE = "https://securetoken.googleapis.com/v1"
+
+# ============================================================
+# FastAPI app
+# ============================================================
+app = FastAPI(title="AMT Auth Service", version="2.0.0")
 
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
@@ -50,23 +55,119 @@ app.add_middleware(
 )
 
 # ============================================================
-# Firebase init
+# Firebase Admin init
 # ============================================================
 def _init_firebase():
     if firebase_admin._apps:
         return
     cred = credentials.Certificate(SERVICE_ACCOUNT)
     firebase_admin.initialize_app(cred)
-    print("[auth] Firebase initialized from hardcoded SERVICE_ACCOUNT")
+    print("[auth] Firebase Admin initialized")
 
 _init_firebase()
+
 
 # ============================================================
 # Endpoints
 # ============================================================
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "amt-auth", "version": "1.0.0"}
+    return {"ok": True, "service": "amt-auth", "version": "2.0.0"}
+
+
+@app.post("/login")
+async def login(body: dict):
+    """body = {"email": "...", "password": "..."}"""
+    email    = (body.get("email") or "").strip()
+    password = body.get("password") or ""
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password required")
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            f"{IDENTITY_BASE}/accounts:signInWithPassword",
+            params={"key": FIREBASE_WEB_API_KEY},
+            json={
+                "email":             email,
+                "password":          password,
+                "returnSecureToken": True,
+            },
+        )
+
+    if r.status_code != 200:
+        try:
+            err = r.json().get("error", {}).get("message", "LOGIN_FAILED")
+        except Exception:
+            err = "LOGIN_FAILED"
+        friendly = {
+            "EMAIL_NOT_FOUND": "Email not registered",
+            "INVALID_PASSWORD": "Incorrect password",
+            "INVALID_LOGIN_CREDENTIALS": "Incorrect email or password",
+            "USER_DISABLED": "Account disabled",
+            "TOO_MANY_ATTEMPTS_TRY_LATER": "Too many attempts — try again later",
+        }.get(err, err)
+        raise HTTPException(status_code=401, detail=friendly)
+
+    data = r.json()
+
+    # Verify token and enforce active claim before handing it back
+    try:
+        decoded = auth.verify_id_token(data["idToken"], check_revoked=True)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Token error: {e}")
+
+    if not decoded.get("active", False):
+        raise HTTPException(status_code=403, detail="Access suspended — contact the administrator")
+
+    return {
+        "ok":           True,
+        "idToken":      data["idToken"],
+        "refreshToken": data["refreshToken"],
+        "expiresIn":    int(data.get("expiresIn", 3600)),
+        "user": {
+            "uid":   decoded.get("uid"),
+            "email": decoded.get("email"),
+        },
+    }
+
+
+@app.post("/refresh")
+async def refresh(body: dict):
+    """body = {"refresh_token": "..."}"""
+    rt = body.get("refresh_token")
+    if not rt:
+        raise HTTPException(status_code=400, detail="refresh_token required")
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            f"{SECURETOKEN_BASE}/token",
+            params={"key": FIREBASE_WEB_API_KEY},
+            data={
+                "grant_type":    "refresh_token",
+                "refresh_token": rt,
+            },
+        )
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+
+    data = r.json()
+
+    # Re-check active claim on refresh
+    try:
+        decoded = auth.verify_id_token(data["id_token"], check_revoked=True)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Token error: {e}")
+
+    if not decoded.get("active", False):
+        raise HTTPException(status_code=403, detail="Access suspended — contact the administrator")
+
+    return {
+        "ok":           True,
+        "idToken":      data["id_token"],
+        "refreshToken": data["refresh_token"],
+        "expiresIn":    int(data.get("expires_in", 3600)),
+    }
 
 
 @app.post("/verify")
@@ -75,7 +176,6 @@ def verify(authorization: str = Header(None)):
         raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
 
     token = authorization.split(" ", 1)[1].strip()
-
     try:
         decoded = auth.verify_id_token(token, check_revoked=True)
     except auth.ExpiredIdTokenError:
@@ -93,8 +193,8 @@ def verify(authorization: str = Header(None)):
     return {
         "ok": True,
         "user": {
-            "uid": decoded.get("uid"),
-            "email": decoded.get("email"),
+            "uid":    decoded.get("uid"),
+            "email":  decoded.get("email"),
             "active": True,
         },
     }
